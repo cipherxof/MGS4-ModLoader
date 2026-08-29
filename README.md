@@ -1,6 +1,6 @@
 # MGS4 Mod Loader
 
-A simple mod loader for METAL GEAR SOLID 4 on PC. It can override files already stored in a PAK, add new virtual files, and merge stage CNF fragments without replacing `data.cnf`.
+A simple mod loader for METAL GEAR SOLID 4 on PC. It can override files already stored in a PAK, replace resources embedded in slot files, add new virtual files, and merge stage CNF fragments without replacing `data.cnf`.
 
 ## Installation
 
@@ -13,6 +13,18 @@ MGS4/
 ```
 
 Packages are sorted by folder name, case-insensitively, and a later package wins when multiple packages override the same virtual file.
+
+## Slot files
+
+Resources embedded in `ww/slotdat/*.slot` can be replaced without modifying or rebuilding the slot. Put loose replacements beneath a package's `slots` directory:
+
+```text
+mods/stage-model-test/
+  slots/
+    slot_s01a10l/
+      s01a11a_east.mdn
+      s01a11a_ground.mdn
+```
 
 ## Stage CNF fragments
 

@@ -33,17 +33,23 @@ bool LoadConfig(const std::filesystem::path& path, ModLoaderConfig& config)
         file << "[ModLoader]\n"
                 "Enabled = true\n"
                 "ModsDirectory = mods\n"
-                "LogOverrides = true\n";
+                "LogOverrides = true\n"
+                "LogAllFileReads = false\n"
+                "LogSlotResources = false\n";
         spdlog::info("Created config file {}", path.generic_string());
     }
 
     config.enabled = Utils::ParseBoolean(ReadIniValue(path, L"Enabled", L"true"), true);
     config.logModOverrides = Utils::ParseBoolean(ReadIniValue(path, L"LogOverrides", L"true"), true);
+    config.logAllFileReads = Utils::ParseBoolean(ReadIniValue(path, L"LogAllFileReads", L"false"), false);
+    config.logSlotResources = Utils::ParseBoolean(ReadIniValue(path, L"LogSlotResources", L"false"), false);
     config.modsDirectory = ReadIniValue(path, L"ModsDirectory", L"mods");
     if (config.modsDirectory.empty())
         config.modsDirectory = L"mods";
 
-    spdlog::info("Config: enabled={}, modsDirectory={}, logOverrides={}", config.enabled,
-                 std::filesystem::path(config.modsDirectory).generic_string(), config.logModOverrides);
+    spdlog::info(
+        "Config: enabled={}, modsDirectory={}, logOverrides={}, logAllFileReads={}, logSlotResources={}",
+        config.enabled, std::filesystem::path(config.modsDirectory).generic_string(), config.logModOverrides,
+        config.logAllFileReads, config.logSlotResources);
     return true;
 }

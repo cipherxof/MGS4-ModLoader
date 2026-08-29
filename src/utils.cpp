@@ -1,6 +1,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
@@ -108,6 +109,57 @@ uint8_t* Utils::PatternScanRange(void* begin, uintptr_t size, const char* signat
             return bytes + offset;
     }
     return nullptr;
+}
+
+bool Utils::ToLowerAscii(const std::wstring& value, std::string& result)
+{
+    result.clear();
+    result.reserve(value.size());
+    for (const wchar_t character : value)
+    {
+        if (character <= 0 || character > 0x7f)
+            return false;
+        result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+    }
+    return !result.empty();
+}
+
+bool Utils::TryParseHexUint32(const std::wstring& value, uint32_t& result)
+{
+    std::wstring digits = value;
+    if (digits.size() == 10 && digits[0] == L'0' && (digits[1] == L'x' || digits[1] == L'X'))
+        digits.erase(0, 2);
+    if (digits.size() != 8)
+        return false;
+
+    uint32_t parsed = 0;
+    for (const wchar_t character : digits)
+    {
+        uint32_t nibble = 0;
+        if (character >= L'0' && character <= L'9')
+            nibble = static_cast<uint32_t>(character - L'0');
+        else if (character >= L'a' && character <= L'f')
+            nibble = static_cast<uint32_t>(character - L'a' + 10);
+        else if (character >= L'A' && character <= L'F')
+            nibble = static_cast<uint32_t>(character - L'A' + 10);
+        else
+            return false;
+        parsed = (parsed << 4) | nibble;
+    }
+
+    result = parsed;
+    return true;
+}
+
+uint32_t Utils::GV_StrCode(std::string_view value)
+{
+    uint32_t hash = 0;
+    for (const unsigned char character : value)
+    {
+        hash = ((hash >> 19) | (hash << 5)) + character;
+        hash &= GV_StrCodeMask;
+    }
+    return hash == 0 ? 1 : hash;
 }
 
 bool Utils::ParseBoolean(std::wstring value, bool fallback)

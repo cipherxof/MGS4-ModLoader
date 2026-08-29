@@ -11,6 +11,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -25,12 +26,18 @@ namespace
                                                      uint64_t offset, uint64_t requestedSize);
     using GameFileOpenADelegate = bool(__fastcall*)(void* file, const char* path, const uint8_t* options);
     using GameFileOpenWDelegate = bool(__fastcall*)(void* file, const wchar_t* path, const uint8_t* options);
+    using SlotResourceLoadDelegate = int32_t(__fastcall*)(void* data, uint32_t resourceId, uint32_t flags,
+                                                          uint32_t size, uint32_t destination,
+                                                          uint32_t slotNameHash, uint32_t pageId);
+    using SlotResourceUnloadDelegate = int64_t(__fastcall*)(void* data, uint32_t resourceId, uint32_t flags);
 
     ArchiveFileInfoDelegate ArchiveFileInfo = nullptr;
     ArchiveLookupDelegate ArchiveLookup = nullptr;
     ArchiveReadDelegate ArchiveRead = nullptr;
     GameFileOpenADelegate GameFileOpenA = nullptr;
     GameFileOpenWDelegate GameFileOpenW = nullptr;
+    SlotResourceLoadDelegate SlotResourceLoad = nullptr;
+    SlotResourceUnloadDelegate SlotResourceUnload = nullptr;
 
     std::filesystem::path GameRoot;
     std::filesystem::path ModRoot;
@@ -43,11 +50,60 @@ namespace
         size_t packageOrder = 0;
     };
 
+    struct IndexedSlotFile
+    {
+        IndexedModFile file;
+        std::string slotName;
+        std::string memberName;
+        uint32_t memberId = 0;
+        bool exactId = false;
+    };
+
+    struct SlotReplacementBuffer
+    {
+        ~SlotReplacementBuffer()
+        {
+            if (data)
+                VirtualFree(data, 0, MEM_RELEASE);
+        }
+
+        void* data = nullptr;
+        uint32_t size = 0;
+        std::filesystem::path path;
+    };
+
+    struct ActiveSlotKey
+    {
+        const void* originalData = nullptr;
+        uint32_t resourceId = 0;
+
+        bool operator==(const ActiveSlotKey& other) const
+        {
+            return originalData == other.originalData && resourceId == other.resourceId;
+        }
+    };
+
+    struct ActiveSlotKeyHash
+    {
+        size_t operator()(const ActiveSlotKey& key) const
+        {
+            const size_t pointerHash = std::hash<const void*>{}(key.originalData);
+            return pointerHash ^ (static_cast<size_t>(key.resourceId) + 0x9e3779b9U + (pointerHash << 6) +
+                                  (pointerHash >> 2));
+        }
+    };
+
     std::unordered_map<std::wstring, IndexedModFile> OverrideIndex;
     std::unordered_map<std::wstring, std::vector<IndexedModFile>> CnfFragmentIndex;
+    std::unordered_map<uint64_t, IndexedSlotFile> ExactSlotOverrideIndex;
+    std::unordered_map<uint64_t, IndexedSlotFile> HashedSlotOverrideIndex;
+    std::unordered_map<uint32_t, std::string> IndexedSlotNames;
+    std::unordered_map<ActiveSlotKey, std::vector<std::shared_ptr<SlotReplacementBuffer>>, ActiveSlotKeyHash>
+        ActiveSlotOverrides;
     std::vector<std::filesystem::path> ModPackages;
     std::mutex LoggedOverridesMutex;
     std::unordered_set<std::string> LoggedOverrides;
+    std::mutex ActiveSlotOverridesMutex;
 
     constexpr uint64_t MaximumReadChunk = 0x7ffff000;
     constexpr int32_t ArchiveReadError = 4;
@@ -176,6 +232,62 @@ namespace
         return key;
     }
 
+    uint64_t MakeSlotKey(uint32_t slotNameHash, uint32_t memberId)
+    {
+        return (static_cast<uint64_t>(slotNameHash & Utils::GV_StrCodeMask) << 32) | memberId;
+    }
+
+    bool IndexSlotOverride(const std::filesystem::path& relative, const IndexedModFile& indexedFile,
+                           size_t& conflictCount)
+    {
+        std::vector<std::filesystem::path> components;
+        for (const auto& component : relative)
+            components.push_back(component);
+
+        if (components.empty() || !EqualsInsensitive(components[0].native(), L"slots"))
+            return false;
+
+        if (components.size() != 3)
+        {
+            spdlog::warn("Ignoring slot override with invalid path (expected slots/<slot>/<file>): {}",
+                         relative.generic_string());
+            return true;
+        }
+
+        std::string slotName;
+        std::string memberName;
+        if (!Utils::ToLowerAscii(components[1].native(), slotName) ||
+            !Utils::ToLowerAscii(components[2].filename().native(), memberName))
+        {
+            spdlog::warn("Ignoring non-ASCII slot override path: {}", relative.generic_string());
+            return true;
+        }
+
+        const uint32_t slotNameHash = Utils::GV_StrCode(slotName);
+        const std::wstring memberStem = components[2].stem().native();
+        uint32_t memberId = 0;
+        const bool exactId = Utils::TryParseHexUint32(memberStem, memberId);
+        if (!exactId)
+        {
+            std::string normalizedStem;
+            if (!Utils::ToLowerAscii(memberStem, normalizedStem))
+            {
+                spdlog::warn("Ignoring slot override with invalid member name: {}", relative.generic_string());
+                return true;
+            }
+            memberId = Utils::GV_StrCode(normalizedStem);
+        }
+
+        IndexedSlotNames[slotNameHash] = slotName;
+        IndexedSlotFile slotFile{indexedFile, slotName, memberName, memberId, exactId};
+        auto& index = exactId ? ExactSlotOverrideIndex : HashedSlotOverrideIndex;
+        const uint64_t key = MakeSlotKey(slotNameHash, memberId);
+        if (index.find(key) != index.end())
+            ++conflictCount;
+        index[key] = std::move(slotFile);
+        return true;
+    }
+
     bool IsCnfFragment(const std::filesystem::path& path)
     {
         const std::wstring filename = path.filename().native();
@@ -201,6 +313,9 @@ namespace
         const auto start = std::chrono::steady_clock::now();
         OverrideIndex.clear();
         CnfFragmentIndex.clear();
+        ExactSlotOverrideIndex.clear();
+        HashedSlotOverrideIndex.clear();
+        IndexedSlotNames.clear();
         ModPackages.clear();
 
         std::error_code error;
@@ -269,6 +384,8 @@ namespace
 
                 const IndexedModFile indexedFile{entry.path(), size, packageOrder};
                 ++indexedFileCount;
+                if (IndexSlotOverride(relative, indexedFile, conflictCount))
+                    continue;
                 if (IsCnfFragment(relative))
                 {
                     const std::filesystem::path dataCnf = relative.parent_path() / L"data.cnf";
@@ -299,9 +416,12 @@ namespace
 
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
-        spdlog::info("Indexed {} files from {} mod packages in {} ms ({} overrides, {} CNF fragments, {} conflicts)",
-                     indexedFileCount, ModPackages.size(), elapsed.count(), OverrideIndex.size(), fragmentCount,
-                     conflictCount);
+        const size_t slotOverrideCount = ExactSlotOverrideIndex.size() + HashedSlotOverrideIndex.size();
+        spdlog::info(
+            "Indexed {} files from {} mod packages in {} ms ({} path overrides, {} slot overrides, {} CNF "
+            "fragments, {} conflicts)",
+            indexedFileCount, ModPackages.size(), elapsed.count(), OverrideIndex.size(), slotOverrideCount,
+            fragmentCount, conflictCount);
         return true;
     }
 
@@ -369,6 +489,30 @@ namespace
         {
             return false;
         }
+    }
+
+    const IndexedSlotFile* ResolveSlotOverride(uint32_t slotNameHash, uint32_t resourceId)
+    {
+        const IndexedSlotFile* result = nullptr;
+        const auto consider = [&](const std::unordered_map<uint64_t, IndexedSlotFile>& index, uint32_t memberId) {
+            const auto found = index.find(MakeSlotKey(slotNameHash, memberId));
+            if (found == index.end())
+                return;
+            if (!result || found->second.file.packageOrder > result->file.packageOrder)
+                result = &found->second;
+        };
+
+        consider(ExactSlotOverrideIndex, resourceId);
+        if ((resourceId & 0x80000000U) != 0)
+            consider(ExactSlotOverrideIndex, resourceId & 0x7fffffffU);
+        consider(HashedSlotOverrideIndex, resourceId & Utils::GV_StrCodeMask);
+        return result;
+    }
+
+    const char* ResolveSlotName(uint32_t slotNameHash)
+    {
+        const auto found = IndexedSlotNames.find(slotNameHash & Utils::GV_StrCodeMask);
+        return found == IndexedSlotNames.end() ? nullptr : found->second.c_str();
     }
 
     bool ResolveCnfMerge(const char* source, CnfMerge& merge)
@@ -479,6 +623,100 @@ namespace
             static_cast<unsigned>(bytes[2]), static_cast<unsigned>(bytes[3]));
     }
 
+    const char* SafePath(const char* path)
+    {
+        return path && *path != '\0' ? path : "<empty>";
+    }
+
+    std::string SafePath(const wchar_t* path)
+    {
+        if (!path || *path == L'\0')
+            return "<empty>";
+
+        try
+        {
+            return std::filesystem::path(path).generic_string();
+        }
+        catch (const std::exception&)
+        {
+            return "<invalid path>";
+        }
+    }
+
+    void LogArchiveRead(const char* path, const char* source, const std::filesystem::path* resolvedPath,
+                        uint64_t offset, uint64_t requestedSize, int32_t result)
+    {
+        if (!ActiveConfig.logAllFileReads)
+            return;
+
+        if (resolvedPath)
+        {
+            spdlog::info("Game file read: path={} source={} resolved={} offset={} requested={} status={}",
+                         SafePath(path), source, resolvedPath->generic_string(), offset, requestedSize, result);
+        }
+        else
+        {
+            spdlog::info("Game file read: path={} source={} offset={} requested={} status={}", SafePath(path),
+                         source, offset, requestedSize, result);
+        }
+    }
+
+    template <typename Path>
+    void LogLooseFileRead(const Path* path, const std::filesystem::path* resolvedPath, bool result)
+    {
+        if (!ActiveConfig.logAllFileReads)
+            return;
+
+        if (resolvedPath)
+        {
+            spdlog::info("Game file read: path={} source=loose-override resolved={} opened={}", SafePath(path),
+                         resolvedPath->generic_string(), result);
+        }
+        else
+        {
+            spdlog::info("Game file read: path={} source=loose opened={}", SafePath(path), result);
+        }
+    }
+
+    void LogSlotResource(uint32_t slotNameHash, uint32_t pageId, uint32_t resourceId, uint32_t size)
+    {
+        if (!ActiveConfig.logSlotResources)
+            return;
+
+        const char* slotName = ResolveSlotName(slotNameHash);
+        if (!slotName)
+            return;
+
+        const std::string key = "slot-resource:" + std::to_string(slotNameHash) + ":" +
+                                std::to_string(pageId) + ":" + std::to_string(resourceId);
+        std::lock_guard<std::mutex> lock(LoggedOverridesMutex);
+        if (!LoggedOverrides.insert(key).second)
+            return;
+
+        spdlog::info("Slot resource: slot={} slotHash={:06x} page={:08x} id={:08x} hash={:06x} size={}",
+                     slotName, slotNameHash & Utils::GV_StrCodeMask, pageId, resourceId,
+                     resourceId & Utils::GV_StrCodeMask, size);
+    }
+
+    void LogSlotOverride(const IndexedSlotFile& overrideFile, uint32_t slotNameHash, uint32_t pageId,
+                         uint32_t resourceId, uint32_t originalSize, uint32_t replacementSize, int32_t result)
+    {
+        if (!ActiveConfig.logModOverrides)
+            return;
+
+        const std::string path = overrideFile.file.path.generic_string();
+        const std::string key = "slot-override:" + path;
+        std::lock_guard<std::mutex> lock(LoggedOverridesMutex);
+        if (!LoggedOverrides.insert(key).second)
+            return;
+
+        spdlog::info(
+            "Slot override: slot={} slotHash={:06x} page={:08x} id={:08x} hash={:06x} original={} "
+            "replacement={} status={} -> {}",
+            overrideFile.slotName, slotNameHash & Utils::GV_StrCodeMask, pageId, resourceId,
+            resourceId & Utils::GV_StrCodeMask, originalSize, replacementSize, result, path);
+    }
+
     bool __fastcall ArchiveFileInfoHook(const char* path, uint64_t* size)
     {
         CnfMerge merge;
@@ -583,6 +821,90 @@ namespace
         return 0;
     }
 
+    std::shared_ptr<SlotReplacementBuffer> LoadSlotReplacement(const IndexedSlotFile& overrideFile)
+    {
+        if (overrideFile.file.size == 0 || overrideFile.file.size > std::numeric_limits<uint32_t>::max())
+        {
+            spdlog::error("Invalid slot override size for {}: {}", overrideFile.file.path.generic_string(),
+                          overrideFile.file.size);
+            return {};
+        }
+
+        try
+        {
+            auto buffer = std::make_shared<SlotReplacementBuffer>();
+            buffer->size = static_cast<uint32_t>(overrideFile.file.size);
+            buffer->path = overrideFile.file.path;
+            buffer->data = VirtualAlloc(nullptr, buffer->size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!buffer->data)
+            {
+                spdlog::error("Failed to allocate {} bytes for slot override {} (error {})", buffer->size,
+                              buffer->path.generic_string(), GetLastError());
+                return {};
+            }
+
+            if (ReadOverride(buffer->path, buffer->size, buffer->data, buffer->size, 0, buffer->size) != 0)
+                return {};
+            return buffer;
+        }
+        catch (const std::exception& exception)
+        {
+            spdlog::error("Failed to prepare slot override {}: {}", overrideFile.file.path.generic_string(),
+                          exception.what());
+            return {};
+        }
+    }
+
+    int32_t __fastcall SlotResourceLoadHook(void* data, uint32_t resourceId, uint32_t flags, uint32_t size,
+                                            uint32_t destination, uint32_t slotNameHash, uint32_t pageId)
+    {
+        const IndexedSlotFile* overrideFile = ResolveSlotOverride(slotNameHash, resourceId);
+        if (!overrideFile)
+        {
+            LogSlotResource(slotNameHash, pageId, resourceId, size);
+            return SlotResourceLoad(data, resourceId, flags, size, destination, slotNameHash, pageId);
+        }
+
+        std::shared_ptr<SlotReplacementBuffer> buffer = LoadSlotReplacement(*overrideFile);
+        if (!buffer)
+        {
+            spdlog::error("Falling back to slot data for {} (slot={}, id={:08x})",
+                          overrideFile->file.path.generic_string(), overrideFile->slotName, resourceId);
+            LogSlotResource(slotNameHash, pageId, resourceId, size);
+            return SlotResourceLoad(data, resourceId, flags, size, destination, slotNameHash, pageId);
+        }
+
+        const int32_t result = SlotResourceLoad(buffer->data, resourceId, flags, buffer->size, destination,
+                                                slotNameHash, pageId);
+        {
+            const ActiveSlotKey key{data, resourceId & 0x7fffffffU};
+            std::lock_guard<std::mutex> lock(ActiveSlotOverridesMutex);
+            ActiveSlotOverrides[key].push_back(buffer);
+        }
+
+        LogSlotOverride(*overrideFile, slotNameHash, pageId, resourceId, size, buffer->size, result);
+        return result;
+    }
+
+    int64_t __fastcall SlotResourceUnloadHook(void* data, uint32_t resourceId, uint32_t flags)
+    {
+        std::shared_ptr<SlotReplacementBuffer> buffer;
+        {
+            const ActiveSlotKey key{data, resourceId & 0x7fffffffU};
+            std::lock_guard<std::mutex> lock(ActiveSlotOverridesMutex);
+            const auto found = ActiveSlotOverrides.find(key);
+            if (found != ActiveSlotOverrides.end() && !found->second.empty())
+            {
+                buffer = std::move(found->second.back());
+                found->second.pop_back();
+                if (found->second.empty())
+                    ActiveSlotOverrides.erase(found);
+            }
+        }
+
+        return SlotResourceUnload(buffer ? buffer->data : data, resourceId, flags);
+    }
+
     int32_t ReadCnfMerge(const char* path, const CnfMerge& merge, void* destination, uint64_t destinationSize,
                          uint64_t offset, uint64_t requestedSize)
     {
@@ -673,16 +995,26 @@ namespace
             if (!merge.baseOverride.empty())
                 LogOverride(path, merge.baseOverride);
             LogCnfMerge(path, merge);
-            return ReadCnfMerge(path, merge, destination, destinationSize, offset, requestedSize);
+            const int32_t result = ReadCnfMerge(path, merge, destination, destinationSize, offset, requestedSize);
+            LogArchiveRead(path, "cnf-merge", merge.baseOverride.empty() ? nullptr : &merge.baseOverride, offset,
+                           requestedSize, result);
+            return result;
         }
 
         std::filesystem::path overridePath;
         uint64_t overrideSize = 0;
         if (!ResolveOverride(path, overridePath, overrideSize))
-            return ArchiveRead(path, destination, destinationSize, offset, requestedSize);
+        {
+            const int32_t result = ArchiveRead(path, destination, destinationSize, offset, requestedSize);
+            LogArchiveRead(path, "archive", nullptr, offset, requestedSize, result);
+            return result;
+        }
 
         LogOverride(path, overridePath);
-        return ReadOverride(overridePath, overrideSize, destination, destinationSize, offset, requestedSize);
+        const int32_t result = ReadOverride(overridePath, overrideSize, destination, destinationSize, offset,
+                                            requestedSize);
+        LogArchiveRead(path, "mod-override", &overridePath, offset, requestedSize, result);
+        return result;
     }
 
     bool IsReadOnlyOpen(const uint8_t* options)
@@ -701,8 +1033,14 @@ namespace
             {
                 const std::string overrideName = overridePath.string();
                 LogOverride(path, overridePath);
-                return GameFileOpenA(file, overrideName.c_str(), options);
+                const bool result = GameFileOpenA(file, overrideName.c_str(), options);
+                LogLooseFileRead(path, &overridePath, result);
+                return result;
             }
+
+            const bool result = GameFileOpenA(file, path, options);
+            LogLooseFileRead(path, nullptr, result);
+            return result;
         }
 
         return GameFileOpenA(file, path, options);
@@ -717,8 +1055,14 @@ namespace
             if (ResolveOverride(path, overridePath, overrideSize))
             {
                 LogOverride(path, overridePath);
-                return GameFileOpenW(file, overridePath.c_str(), options);
+                const bool result = GameFileOpenW(file, overridePath.c_str(), options);
+                LogLooseFileRead(path, &overridePath, result);
+                return result;
             }
+
+            const bool result = GameFileOpenW(file, path, options);
+            LogLooseFileRead(path, nullptr, result);
+            return result;
         }
 
         return GameFileOpenW(file, path, options);
@@ -768,6 +1112,16 @@ namespace
         ArchiveLookup = nullptr;
         ArchiveRead = nullptr;
     }
+
+    void RemoveSlotResourceHooks(uint8_t* load, uint8_t* unload)
+    {
+        if (unload)
+            MH_RemoveHook(unload);
+        if (load)
+            MH_RemoveHook(load);
+        SlotResourceLoad = nullptr;
+        SlotResourceUnload = nullptr;
+    }
 } // namespace
 
 bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSize,
@@ -786,6 +1140,8 @@ bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSi
     constexpr char ArchiveReadPattern[] = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 49 8B D9 49 8B F8 48 8B F2 E8 D3 F7 FF FF 48 8B D0";
     constexpr char ArchiveLookupPattern[] = "48 89 5C 24 18 48 89 74 24 20 41 55 41 56 41 57 48 83 EC 40 45 33 F6";
     constexpr char GameFileOpenPattern[] = "48 89 5C 24 08 57 48 83 EC 40 45 0F B6 48 01 48 8B FA 48 8B D9 45 85 C9 74 16 41 83 F9 01";
+    constexpr char SlotResourceLoadPattern[] = "48 83 EC 48 8B 84 24 ? ? ? ? C6 44 24 38 00 89 44 24 30 8B 44 24 78 89 44 24 28 8B 44 24 70 89 44 24 20 E8 ? ? ? ? 48 83 C4 48 C3";
+    constexpr char SlotResourceUnloadPattern[] = "40 53 41 8B C0 45 8B D8 44 8B CA 48 8B D9 41 0F BA E9 1F 24 02 41 8B C0 44 0F 44 CA 45 8B D1 41 0F BA F2 1F 25 00 80 00 00 45 0F 44 D1 45 8B C2 41 81 E0 FF FF FF 7F 74 ? 48 8B 05";
 
     uint8_t* archiveFileInfo = Utils::PatternScanRange(textBegin, textSize, ArchiveFileInfoPattern);
     uint8_t* archiveRead = Utils::PatternScanRange(textBegin, textSize, ArchiveReadPattern);
@@ -819,6 +1175,28 @@ bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSi
     {
         RemoveArchiveHooks(archiveFileInfo, archiveRead, nullptr);
         return false;
+    }
+
+    uint8_t* slotResourceLoad = Utils::PatternScanRange(textBegin, textSize, SlotResourceLoadPattern);
+    uint8_t* slotResourceUnload = Utils::PatternScanRange(textBegin, textSize, SlotResourceUnloadPattern);
+    if (slotResourceLoad && slotResourceUnload)
+    {
+        Utils::LogAddress("slotResourceLoad", reinterpret_cast<uintptr_t>(slotResourceLoad), gameBase);
+        Utils::LogAddress("slotResourceUnload", reinterpret_cast<uintptr_t>(slotResourceUnload), gameBase);
+
+        if (MH_CreateHook(slotResourceLoad, reinterpret_cast<LPVOID>(&SlotResourceLoadHook),
+                          reinterpret_cast<void**>(&SlotResourceLoad)) != MH_OK ||
+            MH_CreateHook(slotResourceUnload, reinterpret_cast<LPVOID>(&SlotResourceUnloadHook),
+                          reinterpret_cast<void**>(&SlotResourceUnload)) != MH_OK)
+        {
+            RemoveSlotResourceHooks(SlotResourceLoad ? slotResourceLoad : nullptr,
+                                    SlotResourceUnload ? slotResourceUnload : nullptr);
+            spdlog::warn("Slot resource registration hooks were not installed");
+        }
+    }
+    else
+    {
+        spdlog::warn("Slot resource registration functions were not found");
     }
 
     uint8_t* gameFileOpenA = Utils::PatternScanRange(textBegin, textSize, GameFileOpenPattern);

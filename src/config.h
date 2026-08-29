@@ -7,6 +7,8 @@ struct ModLoaderConfig
 {
     bool enabled = true;
     bool logModOverrides = true;
+    bool logAllFileReads = false;
+    bool logSlotResources = false;
     std::wstring modsDirectory = L"mods";
 };
 
