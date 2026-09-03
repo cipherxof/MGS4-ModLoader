@@ -914,6 +914,26 @@ namespace
             return SlotResourceLoad(data, resourceId, flags, size, destination, slotNameHash, pageId);
         }
 
+        if ((resourceId & 0x80000000U) != 0)
+        {
+            std::shared_ptr<SlotReplacementBuffer> existing;
+            {
+                const ActiveSlotKey key{ data, resourceId & 0x7fffffffU };
+                std::lock_guard<std::mutex> lock(ActiveSlotOverridesMutex);
+                const auto found = ActiveSlotOverrides.find(key);
+                if (found != ActiveSlotOverrides.end() && !found->second.empty())
+                    existing = found->second.back();
+            }
+
+            if (existing)
+            {
+                spdlog::info("[LOAD] -> reusing converted buffer={} size={}",
+                    fmt::ptr(existing->data), existing->size);
+                return SlotResourceLoad(existing->data, resourceId, flags, existing->size,
+                    destination, slotNameHash, pageId);
+            }
+        }
+
         std::shared_ptr<SlotReplacementBuffer> buffer = LoadSlotReplacement(*overrideFile);
         if (!buffer)
         {
