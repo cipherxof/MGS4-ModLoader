@@ -57,6 +57,7 @@ namespace
         std::string memberName;
         uint32_t memberId = 0;
         bool exactId = false;
+        uint32_t wantSize = 0;      // 0 = match any size
     };
 
     struct SlotReplacementBuffer
@@ -95,8 +96,8 @@ namespace
 
     std::unordered_map<std::wstring, IndexedModFile> OverrideIndex;
     std::unordered_map<std::wstring, std::vector<IndexedModFile>> CnfFragmentIndex;
-    std::unordered_map<uint64_t, IndexedSlotFile> ExactSlotOverrideIndex;
-    std::unordered_map<uint64_t, IndexedSlotFile> HashedSlotOverrideIndex;
+    std::unordered_map<uint64_t, std::vector<IndexedSlotFile>> ExactSlotOverrideIndex;
+    std::unordered_map<uint64_t, std::vector<IndexedSlotFile>> HashedSlotOverrideIndex;
     std::unordered_map<uint32_t, std::string> IndexedSlotNames;
     std::unordered_map<ActiveSlotKey, std::vector<std::shared_ptr<SlotReplacementBuffer>>, ActiveSlotKeyHash>
         ActiveSlotOverrides;
@@ -237,6 +238,45 @@ namespace
         return (static_cast<uint64_t>(slotNameHash & Utils::GV_StrCodeMask) << 32) | memberId;
     }
 
+    // A member stem may carry an optional size guard: <id>@<decimal-size>, for
+    // example 0d413aa8@389456. A slot and resource id pair is reused across many
+    // different variants of a resource - Old Snake's body resolves to fifteen
+    // separate models at sizes from 201056 to 728944 - so without a guard one file
+    // is forced onto all of them. The guard scopes an override to the variant it
+    // was built for and lets every other variant load untouched.
+    //
+    // Parsed strictly on purpose. A malformed guard that quietly became "match any
+    // size" would be the exact opposite of what the author asked for.
+    bool SplitSizeGuard(std::wstring& stem, uint32_t& wantSize, bool& malformed)
+    {
+        malformed = false;
+        const size_t at = stem.find(L'@');
+        if (at == std::wstring::npos)
+            return false;
+
+        const std::wstring digits = stem.substr(at + 1);
+        uint64_t value = 0;
+        if (digits.empty() || digits.size() > 10)
+            malformed = true;
+        for (const wchar_t character : digits)
+        {
+            if (character < L'0' || character > L'9')
+            {
+                malformed = true;
+                break;
+            }
+            value = value * 10ULL + static_cast<uint64_t>(character - L'0');
+        }
+        if (value == 0 || value > std::numeric_limits<uint32_t>::max())
+            malformed = true;
+        if (malformed)
+            return true;
+
+        wantSize = static_cast<uint32_t>(value);
+        stem.erase(at);
+        return true;
+    }
+
     bool IndexSlotOverride(const std::filesystem::path& relative, const IndexedModFile& indexedFile,
                            size_t& conflictCount)
     {
@@ -264,7 +304,20 @@ namespace
         }
 
         const uint32_t slotNameHash = Utils::GV_StrCode(slotName);
-        const std::wstring memberStem = components[2].stem().native();
+        std::wstring memberStem = components[2].stem().native();
+
+        // Strip the guard before the id is resolved: "0d413aa8@389456" is not valid
+        // hex, so leaving it on would send a perfectly good id down the name-hash
+        // path and it would never match.
+        uint32_t wantSize = 0;
+        bool malformedGuard = false;
+        if (SplitSizeGuard(memberStem, wantSize, malformedGuard) && malformedGuard)
+        {
+            spdlog::warn("Ignoring slot override with an invalid size guard "
+                         "(expected @<1-4294967295>): {}", relative.generic_string());
+            return true;
+        }
+
         uint32_t memberId = 0;
         const bool exactId = Utils::TryParseHexUint32(memberStem, memberId);
         if (!exactId)
@@ -279,12 +332,22 @@ namespace
         }
 
         IndexedSlotNames[slotNameHash] = slotName;
-        IndexedSlotFile slotFile{indexedFile, slotName, memberName, memberId, exactId};
+        IndexedSlotFile slotFile{indexedFile, slotName, memberName, memberId, exactId, wantSize};
         auto& index = exactId ? ExactSlotOverrideIndex : HashedSlotOverrideIndex;
         const uint64_t key = MakeSlotKey(slotNameHash, memberId);
-        if (index.find(key) != index.end())
-            ++conflictCount;
-        index[key] = std::move(slotFile);
+        auto& entries = index[key];
+
+        // Two files only conflict now if they guard the SAME size; several guarded
+        // files under one id is the point of the feature, not a collision.
+        for (const IndexedSlotFile& existing : entries)
+        {
+            if (existing.wantSize == wantSize)
+            {
+                ++conflictCount;
+                break;
+            }
+        }
+        entries.push_back(std::move(slotFile));
         return true;
     }
 
@@ -416,7 +479,11 @@ namespace
 
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start);
-        const size_t slotOverrideCount = ExactSlotOverrideIndex.size() + HashedSlotOverrideIndex.size();
+        size_t slotOverrideCount = 0;
+        for (const auto& entry : ExactSlotOverrideIndex)
+            slotOverrideCount += entry.second.size();
+        for (const auto& entry : HashedSlotOverrideIndex)
+            slotOverrideCount += entry.second.size();
         spdlog::info(
             "Indexed {} files from {} mod packages in {} ms ({} path overrides, {} slot overrides, {} CNF "
             "fragments, {} conflicts)",
@@ -491,22 +558,39 @@ namespace
         }
     }
 
-    const IndexedSlotFile* ResolveSlotOverride(uint32_t slotNameHash, uint32_t resourceId)
+    const IndexedSlotFile* ResolveSlotOverride(uint32_t slotNameHash, uint32_t resourceId, uint32_t size)
     {
-        const IndexedSlotFile* result = nullptr;
-        const auto consider = [&](const std::unordered_map<uint64_t, IndexedSlotFile>& index, uint32_t memberId) {
+        const IndexedSlotFile* guarded = nullptr;     // guards exactly this size
+        const IndexedSlotFile* unguarded = nullptr;   // wantSize 0, the fallback
+        const auto consider = [&](const std::unordered_map<uint64_t, std::vector<IndexedSlotFile>>& index,
+                                  uint32_t memberId) {
             const auto found = index.find(MakeSlotKey(slotNameHash, memberId));
             if (found == index.end())
                 return;
-            if (!result || found->second.file.packageOrder > result->file.packageOrder)
-                result = &found->second;
+            for (const IndexedSlotFile& candidate : found->second)
+            {
+                if (candidate.wantSize == size)
+                {
+                    if (!guarded || candidate.file.packageOrder > guarded->file.packageOrder)
+                        guarded = &candidate;
+                }
+                else if (candidate.wantSize == 0)
+                {
+                    if (!unguarded || candidate.file.packageOrder > unguarded->file.packageOrder)
+                        unguarded = &candidate;
+                }
+            }
         };
 
         consider(ExactSlotOverrideIndex, resourceId);
         if ((resourceId & 0x80000000U) != 0)
             consider(ExactSlotOverrideIndex, resourceId & 0x7fffffffU);
         consider(HashedSlotOverrideIndex, resourceId & Utils::GV_StrCodeMask);
-        return result;
+
+        // A file guarding this exact size wins; otherwise an unguarded file still
+        // applies, so existing mods keep working unchanged. A guarded file that
+        // does not match simply lets the resource through.
+        return guarded ? guarded : unguarded;
     }
 
     const char* ResolveSlotName(uint32_t slotNameHash)
@@ -858,7 +942,7 @@ namespace
     int32_t __fastcall SlotResourceLoadHook(void* data, uint32_t resourceId, uint32_t flags, uint32_t size,
                                             uint32_t destination, uint32_t slotNameHash, uint32_t pageId)
     {
-        const IndexedSlotFile* overrideFile = ResolveSlotOverride(slotNameHash, resourceId);
+        const IndexedSlotFile* overrideFile = ResolveSlotOverride(slotNameHash, resourceId, size);
         if (!overrideFile)
         {
             LogSlotResource(slotNameHash, pageId, resourceId, size);
