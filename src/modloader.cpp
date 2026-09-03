@@ -93,6 +93,29 @@ namespace
         }
     };
 
+    struct SlotReplacementKey
+    {
+        uint32_t slotNameHash = 0;
+        uint32_t resourceId = 0;
+        std::wstring path;
+
+        bool operator==(const SlotReplacementKey& other) const
+        {
+            return slotNameHash == other.slotNameHash && resourceId == other.resourceId && path == other.path;
+        }
+    };
+
+    struct SlotReplacementKeyHash
+    {
+        size_t operator()(const SlotReplacementKey& key) const
+        {
+            size_t hash = std::hash<std::wstring>{}(key.path);
+            hash ^= static_cast<size_t>(key.slotNameHash) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+            hash ^= static_cast<size_t>(key.resourceId) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+
     std::unordered_map<std::wstring, IndexedModFile> OverrideIndex;
     std::unordered_map<std::wstring, std::vector<IndexedModFile>> CnfFragmentIndex;
     std::unordered_map<uint64_t, IndexedSlotFile> ExactSlotOverrideIndex;
@@ -104,6 +127,9 @@ namespace
     std::mutex LoggedOverridesMutex;
     std::unordered_set<std::string> LoggedOverrides;
     std::mutex ActiveSlotOverridesMutex;
+    std::unordered_map<SlotReplacementKey, std::shared_ptr<SlotReplacementBuffer>, SlotReplacementKeyHash>
+        SlotReplacementCache;
+    std::mutex SlotReplacementCacheMutex;
 
     constexpr uint64_t MaximumReadChunk = 0x7ffff000;
     constexpr int32_t ArchiveReadError = 4;
@@ -821,8 +847,22 @@ namespace
         return 0;
     }
 
-    std::shared_ptr<SlotReplacementBuffer> LoadSlotReplacement(const IndexedSlotFile& overrideFile)
+    std::shared_ptr<SlotReplacementBuffer> LoadSlotReplacement(const IndexedSlotFile& overrideFile,
+                                                              uint32_t slotNameHash, uint32_t resourceId)
     {
+        // The engine hands the same resource to SlotResourceLoad more than once - once plain and
+        // then again with bit 31 set - and it expects that resource to map to the same buffer on
+        // every pass. Allocating a fresh block per call makes the later passes fail, so keep one
+        // buffer per (slot, resource, file) and hand the same pointer back.
+        const SlotReplacementKey cacheKey{slotNameHash, resourceId & 0x7fffffffU,
+                                          overrideFile.file.path.native()};
+        {
+            std::lock_guard<std::mutex> lock(SlotReplacementCacheMutex);
+            const auto cached = SlotReplacementCache.find(cacheKey);
+            if (cached != SlotReplacementCache.end())
+                return cached->second;
+        }
+
         if (overrideFile.file.size == 0 || overrideFile.file.size > std::numeric_limits<uint32_t>::max())
         {
             spdlog::error("Invalid slot override size for {}: {}", overrideFile.file.path.generic_string(),
@@ -845,7 +885,12 @@ namespace
 
             if (ReadOverride(buffer->path, buffer->size, buffer->data, buffer->size, 0, buffer->size) != 0)
                 return {};
-            return buffer;
+
+            std::lock_guard<std::mutex> lock(SlotReplacementCacheMutex);
+            auto& cached = SlotReplacementCache[cacheKey];
+            if (!cached)
+                cached = buffer;
+            return cached;
         }
         catch (const std::exception& exception)
         {
@@ -865,7 +910,8 @@ namespace
             return SlotResourceLoad(data, resourceId, flags, size, destination, slotNameHash, pageId);
         }
 
-        std::shared_ptr<SlotReplacementBuffer> buffer = LoadSlotReplacement(*overrideFile);
+        std::shared_ptr<SlotReplacementBuffer> buffer =
+            LoadSlotReplacement(*overrideFile, slotNameHash, resourceId);
         if (!buffer)
         {
             spdlog::error("Falling back to slot data for {} (slot={}, id={:08x})",
