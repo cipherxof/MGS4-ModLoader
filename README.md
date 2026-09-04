@@ -22,8 +22,9 @@ Resources embedded in `ww/slotdat/*.slot` can be replaced without modifying or r
 mods/stage-model-test/
   slots/
     slot_s01a10l/
-      s01a11a_east.mdn
-      s01a11a_ground.mdn
+      0/
+        s01a11a_east.mdn
+        s01a11a_ground.mdn
 ```
 
 ## Stage CNF
