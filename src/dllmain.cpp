@@ -12,7 +12,7 @@
 
 namespace
 {
-    constexpr char Version[] = "0.0.1";
+    constexpr char Version[] = "0.0.2";
     constexpr wchar_t ConfigName[] = L"MGS4ModLoader.ini";
     constexpr wchar_t LogName[] = L"MGS4ModLoader.log";
     constexpr char LogPattern[] = "[%Y-%m-%d %H:%M:%S.%e] [MGS4ModLoader] [%l] %v";
