@@ -11,9 +11,11 @@
 #include <cwctype>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -97,6 +99,9 @@ namespace
     std::unordered_map<std::wstring, std::vector<IndexedModFile>> CnfFragmentIndex;
     std::unordered_map<uint64_t, IndexedSlotFile> ExactSlotOverrideIndex;
     std::unordered_map<uint64_t, IndexedSlotFile> HashedSlotOverrideIndex;
+    using PagedSlotKey = std::tuple<uint32_t, uint32_t, uint32_t>;
+    std::map<PagedSlotKey, IndexedSlotFile> ExactPagedSlotOverrideIndex;
+    std::map<PagedSlotKey, IndexedSlotFile> HashedPagedSlotOverrideIndex;
     std::unordered_map<uint32_t, std::string> IndexedSlotNames;
     std::unordered_map<ActiveSlotKey, std::vector<std::shared_ptr<SlotReplacementBuffer>>, ActiveSlotKeyHash>
         ActiveSlotOverrides;
@@ -238,7 +243,7 @@ namespace
     }
 
     bool IndexSlotOverride(const std::filesystem::path& relative, const IndexedModFile& indexedFile,
-                           size_t& conflictCount)
+        size_t& conflictCount)
     {
         std::vector<std::filesystem::path> components;
         for (const auto& component : relative)
@@ -247,24 +252,35 @@ namespace
         if (components.empty() || !EqualsInsensitive(components[0].native(), L"slots"))
             return false;
 
-        if (components.size() != 3)
+        if (components.size() != 3 && components.size() != 4)
         {
-            spdlog::warn("Ignoring slot override with invalid path (expected slots/<slot>/<file>): {}",
-                         relative.generic_string());
+            spdlog::warn("Ignoring slot override with invalid path "
+                "(expected slots/<slot>/<file> or slots/<slot>/<page>/<file>): {}",
+                relative.generic_string());
+            return true;
+        }
+
+        const bool hasPage = (components.size() == 4);
+        const size_t fileIndex = hasPage ? 3 : 2;
+
+        uint32_t pageId = 0;
+        if (hasPage && !Utils::TryParseHexUint32(components[2].native(), pageId))
+        {
+            spdlog::warn("Ignoring slot override with non-hex page directory: {}", relative.generic_string());
             return true;
         }
 
         std::string slotName;
         std::string memberName;
         if (!Utils::ToLowerAscii(components[1].native(), slotName) ||
-            !Utils::ToLowerAscii(components[2].filename().native(), memberName))
+            !Utils::ToLowerAscii(components[fileIndex].filename().native(), memberName))
         {
             spdlog::warn("Ignoring non-ASCII slot override path: {}", relative.generic_string());
             return true;
         }
 
         const uint32_t slotNameHash = Utils::GV_StrCode(slotName);
-        const std::wstring memberStem = components[2].stem().native();
+        const std::wstring memberStem = components[fileIndex].stem().native();
         uint32_t memberId = 0;
         const bool exactId = Utils::TryParseHexUint32(memberStem, memberId);
         if (!exactId)
@@ -279,12 +295,26 @@ namespace
         }
 
         IndexedSlotNames[slotNameHash] = slotName;
-        IndexedSlotFile slotFile{indexedFile, slotName, memberName, memberId, exactId};
-        auto& index = exactId ? ExactSlotOverrideIndex : HashedSlotOverrideIndex;
-        const uint64_t key = MakeSlotKey(slotNameHash, memberId);
-        if (index.find(key) != index.end())
-            ++conflictCount;
-        index[key] = std::move(slotFile);
+        IndexedSlotFile slotFile{ indexedFile, slotName, memberName, memberId, exactId };
+
+        if (hasPage)
+        {
+            auto& index = exactId ? ExactPagedSlotOverrideIndex : HashedPagedSlotOverrideIndex;
+            const PagedSlotKey key{ slotNameHash & Utils::GV_StrCodeMask, pageId, memberId };
+            if (index.find(key) != index.end())
+                ++conflictCount;
+            index[key] = std::move(slotFile);
+            spdlog::info("Indexed paged slot override: slot={} page={:08x} member={:08x} -> {}", slotName,
+                pageId, memberId, indexedFile.path.generic_string());
+        }
+        else
+        {
+            auto& index = exactId ? ExactSlotOverrideIndex : HashedSlotOverrideIndex;
+            const uint64_t key = MakeSlotKey(slotNameHash, memberId);
+            if (index.find(key) != index.end())
+                ++conflictCount;
+            index[key] = std::move(slotFile);
+        }
         return true;
     }
 
@@ -315,6 +345,8 @@ namespace
         CnfFragmentIndex.clear();
         ExactSlotOverrideIndex.clear();
         HashedSlotOverrideIndex.clear();
+        ExactPagedSlotOverrideIndex.clear();
+        HashedPagedSlotOverrideIndex.clear();
         IndexedSlotNames.clear();
         ModPackages.clear();
 
@@ -491,16 +523,33 @@ namespace
         }
     }
 
-    const IndexedSlotFile* ResolveSlotOverride(uint32_t slotNameHash, uint32_t resourceId)
+    const IndexedSlotFile* ResolveSlotOverride(uint32_t slotNameHash, uint32_t resourceId, uint32_t pageId)
     {
         const IndexedSlotFile* result = nullptr;
+        const uint32_t slot = slotNameHash & Utils::GV_StrCodeMask;
+
+        const auto considerPaged = [&](const std::map<PagedSlotKey, IndexedSlotFile>& index, uint32_t memberId) {
+            const auto found = index.find(PagedSlotKey{ slot, pageId, memberId });
+            if (found == index.end())
+                return;
+            if (!result || found->second.file.packageOrder > result->file.packageOrder)
+                result = &found->second;
+            };
+
+        considerPaged(ExactPagedSlotOverrideIndex, resourceId);
+        if ((resourceId & 0x80000000U) != 0)
+            considerPaged(ExactPagedSlotOverrideIndex, resourceId & 0x7fffffffU);
+        considerPaged(HashedPagedSlotOverrideIndex, resourceId & Utils::GV_StrCodeMask);
+        if (result)
+            return result;
+
         const auto consider = [&](const std::unordered_map<uint64_t, IndexedSlotFile>& index, uint32_t memberId) {
             const auto found = index.find(MakeSlotKey(slotNameHash, memberId));
             if (found == index.end())
                 return;
             if (!result || found->second.file.packageOrder > result->file.packageOrder)
                 result = &found->second;
-        };
+            };
 
         consider(ExactSlotOverrideIndex, resourceId);
         if ((resourceId & 0x80000000U) != 0)
@@ -858,11 +907,31 @@ namespace
     int32_t __fastcall SlotResourceLoadHook(void* data, uint32_t resourceId, uint32_t flags, uint32_t size,
                                             uint32_t destination, uint32_t slotNameHash, uint32_t pageId)
     {
-        const IndexedSlotFile* overrideFile = ResolveSlotOverride(slotNameHash, resourceId);
+        const IndexedSlotFile* overrideFile = ResolveSlotOverride(slotNameHash, resourceId, pageId);
         if (!overrideFile)
         {
             LogSlotResource(slotNameHash, pageId, resourceId, size);
             return SlotResourceLoad(data, resourceId, flags, size, destination, slotNameHash, pageId);
+        }
+
+        if ((resourceId & 0x80000000U) != 0)
+        {
+            std::shared_ptr<SlotReplacementBuffer> existing;
+            {
+                const ActiveSlotKey key{ data, resourceId & 0x7fffffffU };
+                std::lock_guard<std::mutex> lock(ActiveSlotOverridesMutex);
+                const auto found = ActiveSlotOverrides.find(key);
+                if (found != ActiveSlotOverrides.end() && !found->second.empty())
+                    existing = found->second.back();
+            }
+
+            if (existing)
+            {
+                spdlog::info("[LOAD] -> reusing converted buffer={} size={}",
+                    fmt::ptr(existing->data), existing->size);
+                return SlotResourceLoad(existing->data, resourceId, flags, existing->size,
+                    destination, slotNameHash, pageId);
+            }
         }
 
         std::shared_ptr<SlotReplacementBuffer> buffer = LoadSlotReplacement(*overrideFile);
