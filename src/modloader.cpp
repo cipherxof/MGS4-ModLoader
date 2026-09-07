@@ -5,6 +5,7 @@
 #include "spdlog/spdlog.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -45,6 +46,26 @@ namespace
     std::filesystem::path ModRoot;
     HMODULE GameModule = nullptr;
     ModLoaderConfig ActiveConfig;
+
+    // ModPacks = "PackA;PackB" restricts indexing to the listed pack folders (case-insensitive).
+    bool IsPackAllowed(const std::wstring& name)
+    {
+        const std::wstring& list = ActiveConfig.modPacks;
+        if (list.empty())
+            return true;
+        size_t pos = 0;
+        while (pos <= list.size())
+        {
+            size_t end = list.find(L';', pos);
+            if (end == std::wstring::npos)
+                end = list.size();
+            if (_wcsicmp(list.substr(pos, end - pos).c_str(), name.c_str()) == 0)
+                return true;
+            pos = end + 1;
+        }
+        return false;
+    }
+
     struct IndexedModFile
     {
         std::filesystem::path path;
@@ -362,7 +383,12 @@ namespace
         for (const auto& entry : packageIterator)
         {
             if (entry.is_directory(error))
-                ModPackages.push_back(entry.path());
+            {
+                if (IsPackAllowed(entry.path().filename().native()))
+                    ModPackages.push_back(entry.path());
+                else
+                    spdlog::warn("Mod pack ignored (not listed in ModPacks): {}", entry.path().filename().string());
+            }
             error.clear();
         }
 
@@ -478,14 +504,133 @@ namespace
         return !fragments.empty();
     }
 
+
+    // ---- Conditional overrides --------------------------------------------------------------------
+    // A slot page or a path prefix can be tied to the player's equipped outfit / FaceCamo id. The
+    // override is only served while the condition holds, so a replacement can be attached to a
+    // specific costume without touching the original one.
+    struct OverrideCondition { int outfit = -1; int face = -1; };
+    std::unordered_map<uint64_t, OverrideCondition> SlotConditions;                    // slotHash16<<16 | page16
+    std::vector<std::pair<std::wstring, OverrideCondition>> PathConditions;           // normalized prefix
+    uint8_t** PlayerContextPtr = nullptr;   // mgs4.exe+0x1C28B28 -> player context ("linkvarbuf")
+    constexpr uintptr_t PlayerContextRva = 0x1C28B28;
+    constexpr size_t PlayerOutfitOffset = 0xB26;
+    constexpr size_t PlayerFaceOffset = 0xB27;
+
+    // Hook point used by the custom menu entries (see below): a custom outfit is presented to the
+    // game as its base outfit, so the real selection lives here.
+    int VirtualOutfitId = -1;       // -1 = none
+    bool VirtualOutfitActive = false;
+    int VirtualFaceId = -1;
+    bool VirtualFaceActive = false;
+
+    bool ConditionMet(const OverrideCondition& cond)
+    {
+        if (!PlayerContextPtr || !*PlayerContextPtr)
+            return false;
+        const uint8_t* ctx = *PlayerContextPtr;
+        if (cond.outfit >= 0)
+        {
+            if (cond.outfit == VirtualOutfitId)
+            {
+                if (!VirtualOutfitActive)
+                    return false;
+            }
+            else if (ctx[PlayerOutfitOffset] != cond.outfit)
+                return false;
+        }
+        if (cond.face >= 0)
+        {
+            if (cond.face == VirtualFaceId)
+            {
+                if (!VirtualFaceActive)
+                    return false;
+            }
+            else if (ctx[PlayerFaceOffset] != cond.face)
+                return false;
+        }
+        return true;
+    }
+
+    bool ParseCondition(const std::string& text, OverrideCondition& out)
+    {
+        if (text.rfind("face:", 0) == 0) { out.face = atoi(text.c_str() + 5); return true; }
+        if (text.rfind("outfit:", 0) == 0) { out.outfit = atoi(text.c_str() + 7); return true; }
+        return false;
+    }
+
+    void ParseConditions(uintptr_t gameBase)
+    {
+        PlayerContextPtr = reinterpret_cast<uint8_t**>(gameBase + PlayerContextRva);
+        auto forEach = [](const std::string& all, auto&& fn) {
+            size_t pos = 0;
+            while (pos < all.size())
+            {
+                size_t end = all.find(';', pos);
+                if (end == std::string::npos)
+                    end = all.size();
+                const std::string item = all.substr(pos, end - pos);
+                pos = end + 1;
+                const size_t eq = item.find('=');
+                if (eq == std::string::npos)
+                    continue;
+                OverrideCondition cond;
+                if (ParseCondition(item.substr(eq + 1), cond))
+                    fn(item.substr(0, eq), cond);
+            }
+        };
+        forEach(ActiveConfig.slotConditions, [](const std::string& target, const OverrideCondition& cond) {
+            const size_t sl = target.find('/');
+            if (sl == std::string::npos)
+                return;
+            std::string slot = target.substr(0, sl);
+            for (auto& ch : slot)
+                ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+            const uint32_t slotHash = Utils::GV_StrCode(slot.c_str()) & 0xFFFF;
+            const uint32_t pageId = static_cast<uint32_t>(strtoul(target.c_str() + sl + 1, nullptr, 16)) & 0xFFFF;
+            SlotConditions[(static_cast<uint64_t>(slotHash) << 16) | pageId] = cond;
+            spdlog::info("Slot condition: {}/{:04x} outfit={} face={}", slot, pageId, cond.outfit, cond.face);
+        });
+        forEach(ActiveConfig.pathConditions, [](const std::string& prefix, const OverrideCondition& cond) {
+            std::wstring key(prefix.begin(), prefix.end());
+            for (auto& ch : key)
+            {
+                if (ch == L'/')
+                    ch = L'\\';
+                ch = static_cast<wchar_t>(std::towlower(ch));
+            }
+            PathConditions.emplace_back(key, cond);
+            spdlog::info("Path condition: {} outfit={} face={}", prefix, cond.outfit, cond.face);
+        });
+    }
+
+    bool SlotConditionMet(uint32_t slotNameHash, uint32_t pageId)
+    {
+        if (SlotConditions.empty())
+            return true;
+        const auto it = SlotConditions.find((static_cast<uint64_t>(slotNameHash & 0xFFFF) << 16) | (pageId & 0xFFFF));
+        return it == SlotConditions.end() || ConditionMet(it->second);
+    }
+
+    bool PathConditionMet(const std::wstring& key)
+    {
+        for (const auto& pc : PathConditions)
+            if (key.compare(0, pc.first.size(), pc.first) == 0 && !ConditionMet(pc.second))
+                return false;
+        return true;
+    }
+
     bool ResolveOverride(const std::filesystem::path& source, std::filesystem::path& overridePath, uint64_t& size)
     {
         std::filesystem::path relative;
         if (!MakeRelativeGamePath(source, relative))
             return false;
 
-        const auto found = OverrideIndex.find(MakePathKey(relative));
+        const std::wstring key = MakePathKey(relative);
+        const auto found = OverrideIndex.find(key);
         if (found == OverrideIndex.end())
+            return false;
+        if (!PathConditionMet(key))
             return false;
 
         overridePath = found->second.path;
@@ -525,6 +670,8 @@ namespace
 
     const IndexedSlotFile* ResolveSlotOverride(uint32_t slotNameHash, uint32_t resourceId, uint32_t pageId)
     {
+        if (!SlotConditionMet(slotNameHash, pageId))
+            return nullptr;
         const IndexedSlotFile* result = nullptr;
         const uint32_t slot = slotNameHash & Utils::GV_StrCodeMask;
 
@@ -823,6 +970,10 @@ namespace
 
         const uint64_t available = fileSize - offset;
         const uint64_t bytesToRead = std::min(available, requestedSize);
+        // The PC texture streamer requests PC_TXN_UP .data files with destinationSize == 0: the destination
+        // buffer is sized from the texture record, so trust the requested size in that case.
+        if (destinationSize == 0)
+            destinationSize = bytesToRead;
         if (bytesToRead > destinationSize || (bytesToRead != 0 && !destination))
         {
             CloseHandle(file);
@@ -904,9 +1055,36 @@ namespace
         }
     }
 
+    // DumpSlotResources = true writes the ORIGINAL data of every SlotResourceLoad call (before any override)
+    // to logs/dump/<slot>/<page>/<id>.bin. Handy to recover resources that are scrambled inside the .slot file.
+    void DumpSlotResource(uint32_t slotNameHash, uint32_t pageId, uint32_t resourceId, const void* data, uint32_t size)
+    {
+        if (!ActiveConfig.dumpSlotResources || !data || size == 0 || size > (64u << 20))
+            return;
+        const char* slotName = ResolveSlotName(slotNameHash);
+        char fallback[16];
+        snprintf(fallback, sizeof(fallback), "%06x", slotNameHash & Utils::GV_StrCodeMask);
+        char page[16];
+        snprintf(page, sizeof(page), "%08x", pageId);
+        char file[24];
+        snprintf(file, sizeof(file), "%08x.bin", resourceId);
+        std::filesystem::path dir = GameRoot / L"logs" / L"dump" / (slotName ? slotName : fallback) / page;
+        std::error_code error;
+        std::filesystem::create_directories(dir, error);
+        const std::filesystem::path out = dir / file;
+        if (std::filesystem::exists(out, error))
+            return;
+        if (FILE* f = _wfopen(out.c_str(), L"wb"))
+        {
+            fwrite(data, 1, size, f);
+            fclose(f);
+        }
+    }
+
     int32_t __fastcall SlotResourceLoadHook(void* data, uint32_t resourceId, uint32_t flags, uint32_t size,
                                             uint32_t destination, uint32_t slotNameHash, uint32_t pageId)
     {
+        DumpSlotResource(slotNameHash, pageId, resourceId, data, size);
         const IndexedSlotFile* overrideFile = ResolveSlotOverride(slotNameHash, resourceId, pageId);
         if (!overrideFile)
         {
@@ -981,6 +1159,10 @@ namespace
             return ArchiveReadError;
 
         const uint64_t bytesToRead = std::min(merge.size - offset, requestedSize);
+        // The PC texture streamer requests PC_TXN_UP .data files with destinationSize == 0: the destination
+        // buffer is sized from the texture record, so trust the requested size in that case.
+        if (destinationSize == 0)
+            destinationSize = bytesToRead;
         if (bytesToRead > destinationSize || (bytesToRead != 0 && !destination))
             return ArchiveReadError;
         if (bytesToRead == 0)
@@ -1191,6 +1373,303 @@ namespace
         SlotResourceLoad = nullptr;
         SlotResourceUnload = nullptr;
     }
+
+    // ---- HUD name swap ----------------------------------------------------------------------------
+    // SetWidgetText(ctx, widget, text) is the universal UI text setter (every HUD / menu label goes
+    // through it). When the incoming text equals HudNameMatch and the outfit/face condition holds, the
+    // replacement is passed to the game instead. The label widget is remembered so the name can be
+    // refreshed immediately when the player changes outfit or FaceCamo.
+    constexpr char SetWidgetTextPattern[] = "48 89 4C 24 08 53 55 56 57 41 55 48 83 EC 30 33 FF 4D 8B E8 48 8B F2";
+    using SetWidgetTextFn = int64_t(__fastcall*)(void* ctx, void* widget, const char* text);
+    SetWidgetTextFn SetWidgetText = nullptr;
+    char HudNameMatchBuffer[64] = "OLD SNAKE";
+    char HudNameReplaceBuffer[64] = "BIG BOSS";
+    void* HudNameCtx = nullptr;
+    void* HudNameWidget = nullptr;
+
+    bool HudNameConditionMet()
+    {
+        OverrideCondition cond;
+        cond.outfit = ActiveConfig.hudNameOutfit;
+        cond.face = ActiveConfig.hudNameFace;
+        return ConditionMet(cond);
+    }
+
+    int64_t __fastcall SetWidgetTextHook(void* ctx, void* widget, const char* text)
+    {
+        if (text && ActiveConfig.hudNameEnabled)
+        {
+            if (_stricmp(text, HudNameMatchBuffer) == 0 || _stricmp(text, HudNameReplaceBuffer) == 0)
+            {
+                HudNameCtx = ctx;
+                HudNameWidget = widget;
+                if (HudNameConditionMet())
+                    text = HudNameReplaceBuffer;
+            }
+        }
+        return SetWidgetText(ctx, widget, text);
+    }
+
+    void RefreshHudName()
+    {
+        if (!SetWidgetText || !HudNameCtx || !HudNameWidget || !ActiveConfig.hudNameEnabled)
+            return;
+        // same liveness test as the game itself
+        if ((*reinterpret_cast<const uint32_t*>(HudNameWidget) & 0x80000) == 0)
+            return;
+        SetWidgetText(HudNameCtx, HudNameWidget, HudNameConditionMet() ? HudNameReplaceBuffer : HudNameMatchBuffer);
+    }
+
+    void InstallHudNameHook(void* textBegin, uintptr_t textSize, uintptr_t gameBase)
+    {
+        if (!ActiveConfig.hudNameEnabled)
+            return;
+        strncpy(HudNameMatchBuffer, ActiveConfig.hudNameMatch.c_str(), sizeof(HudNameMatchBuffer) - 1);
+        strncpy(HudNameReplaceBuffer, ActiveConfig.hudNameReplace.c_str(), sizeof(HudNameReplaceBuffer) - 1);
+        uint8_t* target = Utils::PatternScanRange(textBegin, textSize, SetWidgetTextPattern);
+        if (!target)
+        {
+            spdlog::warn("HUD name swap: UI text setter not found");
+            return;
+        }
+        Utils::LogAddress("setWidgetText", reinterpret_cast<uintptr_t>(target), gameBase);
+        if (MH_CreateHook(target, reinterpret_cast<LPVOID>(&SetWidgetTextHook), reinterpret_cast<void**>(&SetWidgetText)) != MH_OK)
+        {
+            spdlog::warn("HUD name swap: hook could not be created");
+            SetWidgetText = nullptr;
+            return;
+        }
+        spdlog::info("HUD name swap active: '{}' -> '{}' (outfit {}, face {})", HudNameMatchBuffer, HudNameReplaceBuffer,
+                     ActiveConfig.hudNameOutfit, ActiveConfig.hudNameFace);
+    }
+
+
+    // ---- Custom Camouflage menu entries ---------------------------------------------------------
+    // The FaceCamo list builder (sub_519a90) walks a static table of 15 face ids and writes one
+    // 0xC8-byte row per face at menu+0x2C0; the Costume list builder (sub_514280) does the same with
+    // a table of 5 outfit ids at menu+0x300. Both are left untouched: after they return, one extra
+    // row is appended for the custom entry. Row layout (identical for both lists):
+    //   +0x00 id, +0x08 name (char*), +0x20 description (char*), +0x28 thumbnail strcode,
+    //   +0x2C owned, +0x30 disabled, counters at menu+0x2B8 (owned), +0x2BC/+0x268/+0x274 (rows),
+    //   cursor at +0x270/+0x260/+0x264, scroll set up by sub_4d3610(menu+0x260, menu+0x264, n, min(n,10)).
+    // Selecting the row makes the menu call the equip function with the custom id; the hook turns it
+    // into the base id for the game and remembers the choice (VirtualOutfitActive / VirtualFaceActive),
+    // which the conditional overrides and the HUD name use. Model variants, validity and thumbnails
+    // are borrowed from the base id, so no page is added to any .slot file.
+    constexpr char FaceListPattern[]      = "40 53 56 57 41 55 48 83 EC 28 4C 89 74 24 68 48 8D 05";
+    constexpr char CostumeListPattern[]   = "48 89 5C 24 18 56 57 41 55 41 56 41 57 48 83 EC 20 45 33 FF 48 89 6C 24 50 41 8B FF 44 89 B9 F8";
+    constexpr char FaceMapPattern[]       = "48 83 EC 28 48 8B 05 ? ? ? ? 0F B6 90 27 0B 00 00 44 0F B6 80 26 0B";
+    constexpr char OutfitMapPattern[]     = "48 8B 05 ? ? ? ? 0F B6 90 26 0B 00 00 48 8B 81 E0 00 00 00 48 85 C0";
+    constexpr char ValidityPattern[]      = "48 83 EC 48 48 8B 05 ? ? ? ? 48 85 C0 74 51 4C 8B 88 00 01 00 00";
+    constexpr char OutfitValidityPattern[] = "48 83 EC 38 48 8B 05 ? ? ? ? 4C 63 C1 48 85 C0 74 48 48 8B 90 F8 00";
+    constexpr char EquipPattern[]         = "40 53 57 41 55 48 83 EC 20 4C 8B 2D ? ? ? ? 8B DA 8B F9 4D 85 ED";
+    constexpr char ScrollPattern[]        = "48 89 5C 24 08 48 89 7C 24 10 44 8B 11 41 8B D9 44 8B 1A 48 8B F9 45 85";
+    constexpr uintptr_t PlayerVisualRva = 0x23EB5F08;   // pointer to the player's visual object
+
+    using ListFn = int(__fastcall*)(uint8_t* menu);
+    using MapFn = int(__fastcall*)(void* visual);
+    using ValidityFn = int(__fastcall*)(int area, int outfit, int face);
+    using OutfitValidityFn = int(__fastcall*)(int outfit);
+    using EquipFn = int64_t(__fastcall*)(int outfit, int face);
+    using ScrollFn = int64_t(__fastcall*)(int* cursor, int* scroll, int total, int visible);
+    ListFn FaceListOrig = nullptr; ListFn CostumeListOrig = nullptr;
+    MapFn FaceMapOrig = nullptr; MapFn OutfitMapOrig = nullptr;
+    ValidityFn ValidityOrig = nullptr; OutfitValidityFn OutfitValidityOrig = nullptr;
+    EquipFn EquipOrig = nullptr; ScrollFn ScrollList = nullptr;
+    void** PlayerVisualPtr = nullptr;
+    char CustomFaceName[64] = "BIG BOSS (TRUE)";
+    char CustomFaceDesc[96] = "";
+    char CustomOutfitName[64] = "BIG BOSS (TRUE)";
+    char CustomOutfitDesc[96] = "";
+
+    void AppendRow(uint8_t* menu, size_t rowsOffset, int n, int id, const char* name, const char* desc,
+                   uint32_t thumb, bool selected)
+    {
+        uint8_t* row = menu + rowsOffset + n * 0xC8;
+        memset(row, 0, 0x40);
+        *reinterpret_cast<int32_t*>(row + 0x00) = id;
+        *reinterpret_cast<const char**>(row + 0x08) = name;
+        *reinterpret_cast<const char**>(row + 0x20) = desc;
+        *reinterpret_cast<uint32_t*>(row + 0x28) = thumb;
+        *reinterpret_cast<int32_t*>(row + 0x2C) = 1;   // owned
+        *reinterpret_cast<int32_t*>(row + 0x30) = 0;   // enabled
+        const int total = n + 1;
+        *reinterpret_cast<int32_t*>(menu + 0x2B8) += 1;
+        *reinterpret_cast<int32_t*>(menu + 0x268) = total;
+        *reinterpret_cast<int32_t*>(menu + 0x274) = total;
+        *reinterpret_cast<int32_t*>(menu + (rowsOffset == 0x300 ? 0x2FC : 0x2BC)) = total;
+        if (selected)
+        {
+            *reinterpret_cast<int32_t*>(menu + 0x270) = n;
+            if (*reinterpret_cast<int32_t*>(menu + 0x260) < 0)
+            {
+                *reinterpret_cast<int32_t*>(menu + 0x260) = n;
+                *reinterpret_cast<int32_t*>(menu + 0x264) = 0;
+            }
+        }
+        if (ScrollList)
+            ScrollList(reinterpret_cast<int*>(menu + 0x260), reinterpret_cast<int*>(menu + 0x264), total, total < 10 ? total : 10);
+    }
+
+    uint32_t RowThumb(const uint8_t* rows, int n, int id)
+    {
+        for (int i = 0; i < n; ++i)
+            if (*reinterpret_cast<const int32_t*>(rows + i * 0xC8) == id)
+                return *reinterpret_cast<const uint32_t*>(rows + i * 0xC8 + 0x28);
+        return 0;
+    }
+
+    int __fastcall FaceListHook(uint8_t* menu)
+    {
+        const int n = FaceListOrig(menu);
+        if (!ActiveConfig.customFaceEnabled || !menu || n < 0 || n > 18)
+            return n;
+        const uint32_t thumb = ActiveConfig.customFaceThumb ? ActiveConfig.customFaceThumb
+                                                            : RowThumb(menu + 0x2C0, n, ActiveConfig.customFaceBaseId);
+        AppendRow(menu, 0x2C0, n, ActiveConfig.customFaceId, CustomFaceName, CustomFaceDesc, thumb, VirtualFaceActive);
+        return n + 1;
+    }
+
+    int __fastcall CostumeListHook(uint8_t* menu)
+    {
+        const int n = CostumeListOrig(menu);
+        if (!ActiveConfig.customOutfitEnabled || !menu || n < 0 || n > 8)
+            return n;
+        const uint32_t thumb = ActiveConfig.customOutfitThumb ? ActiveConfig.customOutfitThumb
+                                                              : RowThumb(menu + 0x300, n, ActiveConfig.customOutfitBaseId);
+        AppendRow(menu, 0x300, n, ActiveConfig.customOutfitId, CustomOutfitName, CustomOutfitDesc, thumb, VirtualOutfitActive);
+        return n + 1;
+    }
+
+    // The menu resolves model variants / validity / thumbnails with the custom id: present the base id instead.
+    int __fastcall FaceMapHook(void* visual)
+    {
+        uint8_t* ctx = (PlayerContextPtr && *PlayerContextPtr) ? *PlayerContextPtr : nullptr;
+        if (ActiveConfig.customFaceEnabled && ctx && ctx[PlayerFaceOffset] == ActiveConfig.customFaceId)
+        {
+            ctx[PlayerFaceOffset] = static_cast<uint8_t>(ActiveConfig.customFaceBaseId);
+            const int r = FaceMapOrig(visual);
+            ctx[PlayerFaceOffset] = static_cast<uint8_t>(ActiveConfig.customFaceId);
+            return r;
+        }
+        return FaceMapOrig(visual);
+    }
+
+    int __fastcall OutfitMapHook(void* visual)
+    {
+        uint8_t* ctx = (PlayerContextPtr && *PlayerContextPtr) ? *PlayerContextPtr : nullptr;
+        if (ActiveConfig.customOutfitEnabled && ctx && ctx[PlayerOutfitOffset] == ActiveConfig.customOutfitId)
+        {
+            ctx[PlayerOutfitOffset] = static_cast<uint8_t>(ActiveConfig.customOutfitBaseId);
+            const int r = OutfitMapOrig(visual);
+            ctx[PlayerOutfitOffset] = static_cast<uint8_t>(ActiveConfig.customOutfitId);
+            return r;
+        }
+        return OutfitMapOrig(visual);
+    }
+
+    int __fastcall ValidityHook(int area, int outfit, int face)
+    {
+        if (ActiveConfig.customFaceEnabled && face == ActiveConfig.customFaceId)
+            face = ActiveConfig.customFaceBaseId;
+        if (ActiveConfig.customOutfitEnabled && outfit == ActiveConfig.customOutfitId)
+            outfit = ActiveConfig.customOutfitBaseId;
+        return ValidityOrig(area, outfit, face);
+    }
+
+    int __fastcall OutfitValidityHook(int outfit)
+    {
+        if (ActiveConfig.customOutfitEnabled && outfit == ActiveConfig.customOutfitId)
+            outfit = ActiveConfig.customOutfitBaseId;
+        return OutfitValidityOrig(outfit);
+    }
+
+    // Equip(outfit, face): the game only ever receives base ids. A custom id turns the virtual flag on;
+    // the base id sent again while the other parameter changes keeps it; anything else turns it off.
+    int64_t __fastcall EquipHook(int outfit, int face)
+    {
+        const bool wasOutfit = VirtualOutfitActive, wasFace = VirtualFaceActive;
+        const uint8_t* ctx = (PlayerContextPtr && *PlayerContextPtr) ? *PlayerContextPtr : nullptr;
+        const int ctxOutfit = ctx ? ctx[PlayerOutfitOffset] : -1;
+        const int ctxFace = ctx ? ctx[PlayerFaceOffset] : -1;
+        const bool outfitChanged = outfit != ctxOutfit, faceChanged = face != ctxFace;
+        const bool unchanged = !outfitChanged && !faceChanged;
+        if (ActiveConfig.customOutfitEnabled)
+        {
+            if (outfit == ActiveConfig.customOutfitId) { VirtualOutfitActive = true; outfit = ActiveConfig.customOutfitBaseId; }
+            else if (!(outfit == ActiveConfig.customOutfitBaseId && VirtualOutfitActive && (faceChanged || unchanged)))
+                VirtualOutfitActive = false;
+        }
+        if (ActiveConfig.customFaceEnabled)
+        {
+            if (face == ActiveConfig.customFaceId) { VirtualFaceActive = true; face = ActiveConfig.customFaceBaseId; }
+            else if (!(face == ActiveConfig.customFaceBaseId && VirtualFaceActive && (outfitChanged || unchanged)))
+                VirtualFaceActive = false;
+        }
+        if ((wasOutfit != VirtualOutfitActive || wasFace != VirtualFaceActive) && PlayerVisualPtr && *PlayerVisualPtr)
+        {
+            // same base ids before and after: force the body/head pages to reload so the overrides flip
+            uint8_t* visual = static_cast<uint8_t*>(*PlayerVisualPtr);
+            *reinterpret_cast<int32_t*>(visual + 0xC4) = -1;
+            *reinterpret_cast<int32_t*>(visual + 0xC8) = -1;
+        }
+        spdlog::debug("Equip outfit={} face={} virtualOutfit={} virtualFace={}", outfit, face, VirtualOutfitActive, VirtualFaceActive);
+        const int64_t r = EquipOrig(outfit, face);
+        RefreshHudName();
+        return r;
+    }
+
+    void InstallCustomEntryHooks(void* textBegin, uintptr_t textSize, uintptr_t gameBase)
+    {
+        if (!ActiveConfig.customFaceEnabled && !ActiveConfig.customOutfitEnabled)
+            return;
+        VirtualFaceId = ActiveConfig.customFaceEnabled ? ActiveConfig.customFaceId : -1;
+        VirtualOutfitId = ActiveConfig.customOutfitEnabled ? ActiveConfig.customOutfitId : -1;
+        strncpy(CustomFaceName, ActiveConfig.customFaceName.c_str(), sizeof(CustomFaceName) - 1);
+        strncpy(CustomFaceDesc, ActiveConfig.customFaceDesc.c_str(), sizeof(CustomFaceDesc) - 1);
+        strncpy(CustomOutfitName, ActiveConfig.customOutfitName.c_str(), sizeof(CustomOutfitName) - 1);
+        strncpy(CustomOutfitDesc, ActiveConfig.customOutfitDesc.c_str(), sizeof(CustomOutfitDesc) - 1);
+        PlayerVisualPtr = reinterpret_cast<void**>(gameBase + PlayerVisualRva);
+        struct Site { const char* name; const char* pattern; void* hook; void** original; bool needed; };
+        const Site sites[] = {
+            {"faceList", FaceListPattern, reinterpret_cast<void*>(&FaceListHook), reinterpret_cast<void**>(&FaceListOrig), ActiveConfig.customFaceEnabled},
+            {"faceMap", FaceMapPattern, reinterpret_cast<void*>(&FaceMapHook), reinterpret_cast<void**>(&FaceMapOrig), ActiveConfig.customFaceEnabled},
+            {"costumeList", CostumeListPattern, reinterpret_cast<void*>(&CostumeListHook), reinterpret_cast<void**>(&CostumeListOrig), ActiveConfig.customOutfitEnabled},
+            {"outfitMap", OutfitMapPattern, reinterpret_cast<void*>(&OutfitMapHook), reinterpret_cast<void**>(&OutfitMapOrig), ActiveConfig.customOutfitEnabled},
+            {"outfitValidity", OutfitValidityPattern, reinterpret_cast<void*>(&OutfitValidityHook), reinterpret_cast<void**>(&OutfitValidityOrig), ActiveConfig.customOutfitEnabled},
+            {"validity", ValidityPattern, reinterpret_cast<void*>(&ValidityHook), reinterpret_cast<void**>(&ValidityOrig), true},
+            {"equip", EquipPattern, reinterpret_cast<void*>(&EquipHook), reinterpret_cast<void**>(&EquipOrig), true},
+        };
+        uint8_t* scroll = Utils::PatternScanRange(textBegin, textSize, ScrollPattern);
+        if (!scroll)
+        {
+            spdlog::warn("Custom menu entries: list scroll helper not found");
+            return;
+        }
+        ScrollList = reinterpret_cast<ScrollFn>(scroll);
+        for (const Site& site : sites)
+        {
+            if (!site.needed)
+                continue;
+            uint8_t* target = Utils::PatternScanRange(textBegin, textSize, site.pattern);
+            if (!target)
+            {
+                spdlog::warn("Custom menu entries: '{}' not found", site.name);
+                return;
+            }
+            Utils::LogAddress(site.name, reinterpret_cast<uintptr_t>(target), gameBase);
+            if (MH_CreateHook(target, site.hook, site.original) != MH_OK)
+            {
+                spdlog::warn("Custom menu entries: hook '{}' could not be created", site.name);
+                return;
+            }
+        }
+        if (ActiveConfig.customFaceEnabled)
+            spdlog::info("Custom FaceCamo entry: id {} (base {}) '{}'", ActiveConfig.customFaceId, ActiveConfig.customFaceBaseId, CustomFaceName);
+        if (ActiveConfig.customOutfitEnabled)
+            spdlog::info("Custom costume entry: id {} (base {}) '{}'", ActiveConfig.customOutfitId, ActiveConfig.customOutfitBaseId, CustomOutfitName);
+    }
+
 } // namespace
 
 bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSize,
@@ -1293,6 +1772,10 @@ bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSi
     {
         spdlog::warn("Loose-file wrappers were not found");
     }
+
+    ParseConditions(gameBase);
+    InstallHudNameHook(textBegin, textSize, gameBase);
+    InstallCustomEntryHooks(textBegin, textSize, gameBase);
 
     spdlog::info("MGS4 mod loader installed: {}", ModRoot.generic_string());
     return true;
