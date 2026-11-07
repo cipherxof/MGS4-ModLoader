@@ -1191,6 +1191,27 @@ namespace
         SlotResourceLoad = nullptr;
         SlotResourceUnload = nullptr;
     }
+
+    // Finds the first pattern match whose rel32 call at callOffset targets the given function.
+    uint8_t* FindCaller(void* textBegin, uintptr_t textSize, const char* pattern, uintptr_t callOffset,
+                        const uint8_t* target)
+    {
+        auto* begin = static_cast<uint8_t*>(textBegin);
+        auto* const end = begin + textSize;
+        while (begin < end)
+        {
+            uint8_t* match = Utils::PatternScanRange(begin, static_cast<uintptr_t>(end - begin), pattern);
+            if (!match)
+                return nullptr;
+
+            int32_t displacement;
+            std::memcpy(&displacement, match + callOffset + 1, sizeof(displacement));
+            if (match + callOffset + 5 + displacement == target)
+                return match;
+            begin = match + 1;
+        }
+        return nullptr;
+    }
 } // namespace
 
 bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSize,
@@ -1205,16 +1226,16 @@ bool MGS4ModLoader_Install(HMODULE gameModule, void* textBegin, uintptr_t textSi
         return false;
     }
 
-    constexpr char ArchiveFileInfoPattern[] = "40 53 48 83 EC 20 48 8B DA E8 72 00 00 00 48 85 C0 74 12 48 8B 08 48 85 C0 48 89 0B 0F 95 C0";
-    constexpr char ArchiveReadPattern[] = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 49 8B D9 49 8B F8 48 8B F2 E8 D3 F7 FF FF 48 8B D0";
+    constexpr char ArchiveFileInfoPattern[] = "40 53 48 83 EC 20 48 8B DA E8 ? ? ? ? 48 85 C0 74 12 48 8B 08 48 85 C0 48 89 0B 0F 95 C0";
+    constexpr char ArchiveReadPattern[] = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 49 8B D9 49 8B F8 48 8B F2 E8 ? ? ? ? 48 8B D0";
     constexpr char ArchiveLookupPattern[] = "48 89 5C 24 18 48 89 74 24 20 41 55 41 56 41 57 48 83 EC 40 45 33 F6";
     constexpr char GameFileOpenPattern[] = "48 89 5C 24 08 57 48 83 EC 40 45 0F B6 48 01 48 8B FA 48 8B D9 45 85 C9 74 16 41 83 F9 01";
     constexpr char SlotResourceLoadPattern[] = "48 83 EC 48 8B 84 24 ? ? ? ? C6 44 24 38 00 89 44 24 30 8B 44 24 78 89 44 24 28 8B 44 24 70 89 44 24 20 E8 ? ? ? ? 48 83 C4 48 C3";
     constexpr char SlotResourceUnloadPattern[] = "40 53 41 8B C0 45 8B D8 44 8B CA 48 8B D9 41 0F BA E9 1F 24 02 41 8B C0 44 0F 44 CA 45 8B D1 41 0F BA F2 1F 25 00 80 00 00 45 0F 44 D1 45 8B C2 41 81 E0 FF FF FF 7F 74 ? 48 8B 05";
 
-    uint8_t* archiveFileInfo = Utils::PatternScanRange(textBegin, textSize, ArchiveFileInfoPattern);
-    uint8_t* archiveRead = Utils::PatternScanRange(textBegin, textSize, ArchiveReadPattern);
     uint8_t* archiveLookup = Utils::PatternScanRange(textBegin, textSize, ArchiveLookupPattern);
+    uint8_t* archiveFileInfo = archiveLookup ? FindCaller(textBegin, textSize, ArchiveFileInfoPattern, 0x09, archiveLookup) : nullptr;
+    uint8_t* archiveRead = archiveLookup ? FindCaller(textBegin, textSize, ArchiveReadPattern, 0x18, archiveLookup) : nullptr;
     if (!archiveFileInfo || !archiveRead || !archiveLookup)
     {
         spdlog::error("Failed to locate the MGS4 path-based PAK API");
